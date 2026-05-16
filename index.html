@@ -1,0 +1,1106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Meal Prep Coordinator</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/lz-string@1.5.0/libs/lz-string.min.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }
+  .macro { font-variant-numeric: tabular-nums; }
+  details > summary { cursor: pointer; list-style: none; }
+  details > summary::-webkit-details-marker { display: none; }
+  .recipe-body { white-space: pre-wrap; }
+  @media print {
+    .no-print { display: none !important; }
+  }
+</style>
+</head>
+<body class="bg-stone-50 text-stone-900 min-h-screen">
+
+<!-- ============================= NAV ============================= -->
+<nav class="bg-white border-b border-stone-200 sticky top-0 z-30 no-print">
+  <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2">
+      <span class="text-2xl">🥗</span>
+      <h1 class="font-semibold text-lg">Meal Prep Coordinator</h1>
+    </div>
+    <div id="nav-links" class="flex items-center gap-1 text-sm"></div>
+  </div>
+</nav>
+
+<main id="app" class="max-w-5xl mx-auto px-4 py-6"></main>
+
+<!-- ============================= TOAST ============================= -->
+<div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 bg-stone-900 text-white px-4 py-2 rounded-lg shadow-lg opacity-0 transition-opacity pointer-events-none z-50"></div>
+
+<script>
+/* ========================================================================== */
+/*  STATE                                                                     */
+/* ========================================================================== */
+const STORAGE_KEY = 'mealprep.v1';
+
+const defaultState = () => ({
+  apiKey: '',
+  model: 'claude-sonnet-4-5',
+  profiles: {
+    a: {
+      name: 'Person A',
+      weightLbs: 220,
+      gender: 'male',
+      activity: 'Daily exercise 45 min + 10k steps',
+      goal: 'Lose 1 lb/week',
+      kcalTarget: 2400,
+      proteinTarget: 330,
+      carbRangeLow: 100,
+      carbRangeHigh: 150,
+      notes: 'Low-carb-friendly. Emphasize healthy fats. Higher protein.',
+    },
+    b: {
+      name: 'Person B',
+      weightLbs: 150,
+      gender: 'female',
+      activity: 'Runs 2-3x/wk + lifts 1-2x/wk + 10k steps',
+      goal: 'Lose weight gradually',
+      kcalTarget: 1700,
+      proteinTarget: 130,
+      carbRangeLow: 150,
+      carbRangeHigh: 220,
+      notes: 'Struggles on low-carb. Prefer meals with optional add-on carbs.',
+    },
+  },
+  styleNotes: '',
+  lastGeneration: null,   // { prompt, timestamp, meals: {breakfast:[], lunch:[], dinner:[], snack:[]} }
+  picks: { breakfast: [], lunch: [], dinner: [], snack: [] },  // arrays of meal IDs
+  finalPlan: null,        // set in review/shopping step
+  checkedItems: {},       // shopping checkboxes
+});
+
+let state = loadState();
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return defaultState();
+    return { ...defaultState(), ...JSON.parse(raw) };
+  } catch (e) {
+    return defaultState();
+  }
+}
+function saveState() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+/* ========================================================================== */
+/*  ROUTER                                                                    */
+/* ========================================================================== */
+const routes = ['setup', 'generate', 'picks', 'share', 'review', 'shopping'];
+
+function currentRoute() {
+  const h = location.hash.replace(/^#/, '');
+  const base = h.split('?')[0] || 'setup';
+  return routes.includes(base) ? base : 'setup';
+}
+
+function routeParams() {
+  // We do NOT use URLSearchParams here because LZString-encoded values can contain "+",
+  // which URLSearchParams would interpret as a space. We treat values as raw strings.
+  const h = location.hash;
+  const qIdx = h.indexOf('?');
+  if (qIdx < 0) return {};
+  const params = {};
+  h.slice(qIdx + 1).split('&').forEach((pair) => {
+    if (!pair) return;
+    const eq = pair.indexOf('=');
+    if (eq < 0) params[pair] = '';
+    else params[pair.slice(0, eq)] = pair.slice(eq + 1);
+  });
+  return params;
+}
+
+function go(route, params = {}) {
+  // Raw concatenation — values from LZString.compressToEncodedURIComponent are already URI-safe
+  // and re-encoding them would corrupt the "+" characters.
+  const entries = Object.entries(params);
+  const qs = entries.map(([k, v]) => `${k}=${v}`).join('&');
+  location.hash = qs ? `${route}?${qs}` : route;
+}
+
+window.addEventListener('hashchange', render);
+
+/* ========================================================================== */
+/*  TOAST                                                                     */
+/* ========================================================================== */
+let toastTimer = null;
+function toast(msg, ms = 2200) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.opacity = '1';
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (el.style.opacity = '0'), ms);
+}
+
+/* ========================================================================== */
+/*  UTIL                                                                      */
+/* ========================================================================== */
+const escapeHtml = (s) =>
+  String(s ?? '').replace(/[&<>"']/g, (m) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
+
+const round = (n, p = 0) => {
+  const f = Math.pow(10, p);
+  return Math.round(n * f) / f;
+};
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+function copyToClipboard(text) {
+  return navigator.clipboard.writeText(text).then(
+    () => toast('Copied to clipboard'),
+    () => toast('Copy failed — select & copy manually')
+  );
+}
+
+/* ========================================================================== */
+/*  RENDER (top-level dispatch)                                               */
+/* ========================================================================== */
+function render() {
+  // Detect incoming share link: #review?d=...
+  const route = currentRoute();
+  const params = routeParams();
+
+  // Update nav active states
+  renderNav(route);
+
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+
+  if (route === 'setup')    return renderSetup(app);
+  if (route === 'generate') return renderGenerate(app);
+  if (route === 'picks')    return renderPicks(app);
+  if (route === 'share')    return renderShare(app);
+  if (route === 'review')   return renderReview(app, params.d);
+  if (route === 'shopping') return renderShopping(app);
+}
+
+function renderNav(active) {
+  const links = [
+    ['setup',    '1. Profiles'],
+    ['generate', '2. Generate'],
+    ['picks',    '3. Pick 3'],
+    ['share',    '4. Share'],
+    ['shopping', '5. Shopping'],
+  ];
+  document.getElementById('nav-links').innerHTML = links
+    .map(([id, label]) => {
+      const cls = id === active
+        ? 'bg-emerald-100 text-emerald-900'
+        : 'text-stone-600 hover:bg-stone-100';
+      return `<a href="#${id}" class="px-3 py-1.5 rounded-md ${cls}">${label}</a>`;
+    })
+    .join('');
+}
+
+/* ========================================================================== */
+/*  VIEW: SETUP / PROFILES                                                    */
+/* ========================================================================== */
+function renderSetup(root) {
+  const p = state.profiles;
+  root.innerHTML = `
+    <div class="space-y-6">
+      <header>
+        <h2 class="text-2xl font-semibold">Setup</h2>
+        <p class="text-stone-600 mt-1">Configure each person's profile and your Claude API key. Everything is stored in this browser only.</p>
+      </header>
+
+      <section class="bg-white p-5 rounded-lg border border-stone-200">
+        <h3 class="font-semibold mb-3">Claude API</h3>
+        <label class="block text-sm font-medium text-stone-700 mb-1">Anthropic API key</label>
+        <input id="api-key" type="password" placeholder="sk-ant-..." value="${escapeHtml(state.apiKey)}"
+          class="w-full px-3 py-2 border border-stone-300 rounded-md font-mono text-sm" />
+        <p class="text-xs text-stone-500 mt-1">Stored in this browser's localStorage. Get one at console.anthropic.com.</p>
+
+        <label class="block text-sm font-medium text-stone-700 mb-1 mt-4">Model</label>
+        <select id="model" class="px-3 py-2 border border-stone-300 rounded-md text-sm">
+          <option value="claude-sonnet-4-5" ${state.model==='claude-sonnet-4-5'?'selected':''}>claude-sonnet-4-5 (recommended)</option>
+          <option value="claude-opus-4-6" ${state.model==='claude-opus-4-6'?'selected':''}>claude-opus-4-6 (slower, smarter)</option>
+          <option value="claude-haiku-4-5" ${state.model==='claude-haiku-4-5'?'selected':''}>claude-haiku-4-5 (fastest)</option>
+        </select>
+      </section>
+
+      ${profileCard('a', p.a, 'Person A')}
+      ${profileCard('b', p.b, 'Person B')}
+
+      <section class="bg-white p-5 rounded-lg border border-stone-200">
+        <h3 class="font-semibold mb-3">Cooking style preferences (optional)</h3>
+        <textarea id="style-notes" rows="3" placeholder="e.g., Mediterranean-leaning, easy bulk prep on Sundays, no shellfish, love spicy food..."
+          class="w-full px-3 py-2 border border-stone-300 rounded-md text-sm">${escapeHtml(state.styleNotes)}</textarea>
+      </section>
+
+      <div class="flex gap-3">
+        <button id="save-setup" class="px-5 py-2.5 bg-emerald-700 text-white rounded-md font-medium hover:bg-emerald-800">Save & continue</button>
+        <button id="reset-state" class="px-5 py-2.5 bg-white border border-stone-300 text-stone-700 rounded-md hover:bg-stone-100">Reset all data</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('save-setup').onclick = () => {
+    state.apiKey = document.getElementById('api-key').value.trim();
+    state.model = document.getElementById('model').value;
+    state.styleNotes = document.getElementById('style-notes').value;
+    ['a','b'].forEach((k) => {
+      state.profiles[k] = readProfile(k);
+    });
+    saveState();
+    toast('Saved');
+    go('generate');
+  };
+  document.getElementById('reset-state').onclick = () => {
+    if (!confirm('Wipe all data (profiles, API key, picks)?')) return;
+    localStorage.removeItem(STORAGE_KEY);
+    state = defaultState();
+    render();
+  };
+}
+
+function profileCard(key, p, fallback) {
+  return `
+    <section class="bg-white p-5 rounded-lg border border-stone-200">
+      <h3 class="font-semibold mb-3">${escapeHtml(p.name || fallback)} — profile</h3>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <label class="block text-sm">Name<br><input data-pf="${key}.name" value="${escapeHtml(p.name)}" class="w-full mt-1 px-3 py-2 border border-stone-300 rounded-md"></label>
+        <label class="block text-sm">Weight (lbs)<br><input data-pf="${key}.weightLbs" type="number" value="${p.weightLbs}" class="w-full mt-1 px-3 py-2 border border-stone-300 rounded-md"></label>
+        <label class="block text-sm">Activity<br><input data-pf="${key}.activity" value="${escapeHtml(p.activity)}" class="w-full mt-1 px-3 py-2 border border-stone-300 rounded-md"></label>
+        <label class="block text-sm">Goal<br><input data-pf="${key}.goal" value="${escapeHtml(p.goal)}" class="w-full mt-1 px-3 py-2 border border-stone-300 rounded-md"></label>
+        <label class="block text-sm">Daily kcal target<br><input data-pf="${key}.kcalTarget" type="number" value="${p.kcalTarget}" class="w-full mt-1 px-3 py-2 border border-stone-300 rounded-md"></label>
+        <label class="block text-sm">Daily protein target (g)<br><input data-pf="${key}.proteinTarget" type="number" value="${p.proteinTarget}" class="w-full mt-1 px-3 py-2 border border-stone-300 rounded-md"></label>
+        <label class="block text-sm">Carb range low (g)<br><input data-pf="${key}.carbRangeLow" type="number" value="${p.carbRangeLow}" class="w-full mt-1 px-3 py-2 border border-stone-300 rounded-md"></label>
+        <label class="block text-sm">Carb range high (g)<br><input data-pf="${key}.carbRangeHigh" type="number" value="${p.carbRangeHigh}" class="w-full mt-1 px-3 py-2 border border-stone-300 rounded-md"></label>
+        <label class="block text-sm md:col-span-2">Notes / preferences<br><textarea data-pf="${key}.notes" rows="2" class="w-full mt-1 px-3 py-2 border border-stone-300 rounded-md">${escapeHtml(p.notes)}</textarea></label>
+      </div>
+    </section>
+  `;
+}
+
+function readProfile(k) {
+  const get = (field) => {
+    const el = document.querySelector(`[data-pf="${k}.${field}"]`);
+    return el ? el.value : '';
+  };
+  return {
+    name: get('name'),
+    weightLbs: Number(get('weightLbs')) || 0,
+    gender: state.profiles[k].gender,
+    activity: get('activity'),
+    goal: get('goal'),
+    kcalTarget: Number(get('kcalTarget')) || 0,
+    proteinTarget: Number(get('proteinTarget')) || 0,
+    carbRangeLow: Number(get('carbRangeLow')) || 0,
+    carbRangeHigh: Number(get('carbRangeHigh')) || 0,
+    notes: get('notes'),
+  };
+}
+
+/* ========================================================================== */
+/*  VIEW: GENERATE                                                            */
+/* ========================================================================== */
+function renderGenerate(root) {
+  const lastPrompt = state.lastGeneration?.prompt || '';
+  root.innerHTML = `
+    <div class="space-y-5">
+      <header>
+        <h2 class="text-2xl font-semibold">Generate meal ideas</h2>
+        <p class="text-stone-600 mt-1">Describe what kind of menu you want this week. Claude returns 5 breakfasts, 5 lunches, 5 dinners, and 5 snacks tailored to both profiles.</p>
+      </header>
+
+      <section class="bg-white p-5 rounded-lg border border-stone-200">
+        <label class="block text-sm font-medium mb-1">Menu prompt</label>
+        <textarea id="prompt" rows="5" placeholder="e.g., Mediterranean theme this week, big batch prep on Sunday. Lean toward bowls and sheet-pan dinners. Include one breakfast that travels well."
+          class="w-full px-3 py-2 border border-stone-300 rounded-md text-sm">${escapeHtml(lastPrompt)}</textarea>
+        <div class="flex flex-wrap gap-2 mt-3">
+          <button class="quick-prompt text-xs px-3 py-1 bg-stone-100 hover:bg-stone-200 rounded-full">Mediterranean</button>
+          <button class="quick-prompt text-xs px-3 py-1 bg-stone-100 hover:bg-stone-200 rounded-full">Tex-Mex bowls</button>
+          <button class="quick-prompt text-xs px-3 py-1 bg-stone-100 hover:bg-stone-200 rounded-full">Asian-inspired</button>
+          <button class="quick-prompt text-xs px-3 py-1 bg-stone-100 hover:bg-stone-200 rounded-full">Sheet-pan & one-pot</button>
+          <button class="quick-prompt text-xs px-3 py-1 bg-stone-100 hover:bg-stone-200 rounded-full">Comfort food, lighter</button>
+        </div>
+        <div class="mt-4 flex items-center gap-3">
+          <button id="generate-btn" class="px-5 py-2.5 bg-emerald-700 text-white rounded-md font-medium hover:bg-emerald-800 disabled:opacity-60">Generate meals</button>
+          <span id="gen-status" class="text-sm text-stone-600"></span>
+        </div>
+        ${!state.apiKey ? `<p class="mt-3 text-sm text-amber-700">No API key set. <a href="#setup" class="underline">Add one in Setup</a> first.</p>` : ''}
+      </section>
+
+      <div id="results"></div>
+    </div>
+  `;
+
+  document.querySelectorAll('.quick-prompt').forEach((btn) => {
+    btn.onclick = () => {
+      const ta = document.getElementById('prompt');
+      ta.value = (ta.value ? ta.value + ' ' : '') + btn.textContent + '.';
+    };
+  });
+
+  document.getElementById('generate-btn').onclick = onGenerate;
+
+  // If we already have a generation cached, show it
+  if (state.lastGeneration) {
+    renderResults(state.lastGeneration.meals);
+  }
+}
+
+async function onGenerate() {
+  const promptEl = document.getElementById('prompt');
+  const statusEl = document.getElementById('gen-status');
+  const btn = document.getElementById('generate-btn');
+  const userPrompt = promptEl.value.trim();
+  if (!state.apiKey) { toast('Set an API key in Setup'); return; }
+  if (!userPrompt) { toast('Enter a prompt'); return; }
+
+  btn.disabled = true;
+  statusEl.innerHTML = `<span class="inline-block animate-pulse">Calling Claude…</span> <span class="text-stone-400">(typically 20-40s)</span>`;
+
+  try {
+    const result = await callClaudeForMeals(userPrompt);
+    state.lastGeneration = {
+      prompt: userPrompt,
+      timestamp: Date.now(),
+      meals: result,
+    };
+    // Reset picks when re-generating
+    state.picks = { breakfast: [], lunch: [], dinner: [], snack: [] };
+    saveState();
+    statusEl.textContent = 'Done.';
+    renderResults(result);
+  } catch (e) {
+    console.error(e);
+    statusEl.innerHTML = `<span class="text-red-700">Error: ${escapeHtml(e.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderResults(meals) {
+  const root = document.getElementById('results');
+  if (!root) return;
+  const order = [
+    ['breakfast', 'Breakfast', '☕'],
+    ['lunch', 'Lunch', '🥙'],
+    ['dinner', 'Dinner', '🍽️'],
+    ['snack', 'Snacks', '🍎'],
+  ];
+  root.innerHTML = `
+    <div class="space-y-6 mt-2">
+      ${order.map(([key, label, emoji]) => `
+        <section>
+          <h3 class="text-lg font-semibold mb-3">${emoji} ${label}</h3>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            ${(meals[key] || []).map((m) => mealCard(m, key, /*pickable=*/false)).join('')}
+          </div>
+        </section>
+      `).join('')}
+      <div class="pt-4 border-t border-stone-200">
+        <button id="go-pick" class="px-5 py-2.5 bg-emerald-700 text-white rounded-md font-medium hover:bg-emerald-800">Next: pick my top 3 in each category →</button>
+      </div>
+    </div>
+  `;
+  const go_pick = document.getElementById('go-pick');
+  if (go_pick) go_pick.onclick = () => go('picks');
+}
+
+/* ========================================================================== */
+/*  MEAL CARD                                                                 */
+/* ========================================================================== */
+function mealCard(m, category, pickable, isPicked) {
+  const macros = m.macrosPerServing || {};
+  const ringClass = pickable && isPicked ? 'ring-2 ring-emerald-500 bg-emerald-50' : 'bg-white';
+  const checkboxHtml = pickable
+    ? `<label class="flex items-center gap-2 cursor-pointer">
+         <input type="checkbox" data-pick="${m.id}" data-cat="${category}" ${isPicked ? 'checked' : ''} class="w-5 h-5 accent-emerald-600">
+         <span class="text-sm font-medium">${isPicked ? 'Picked' : 'Pick this'}</span>
+       </label>`
+    : '';
+  const linkHtml = m.recipeUrl
+    ? `<a href="${escapeHtml(m.recipeUrl)}" target="_blank" rel="noopener" class="text-sm text-emerald-700 underline">Recipe link ↗</a>`
+    : '';
+  const addonHtml = m.carbAddon
+    ? `<div class="mt-2 text-xs text-stone-600 italic">+ optional carb add-on: ${escapeHtml(m.carbAddon.amount)} ${escapeHtml(m.carbAddon.unit)} ${escapeHtml(m.carbAddon.item)} (+${m.carbAddon.macros?.kcal||0} kcal)</div>`
+    : '';
+
+  return `
+    <article class="rounded-lg border border-stone-200 ${ringClass} p-4 shadow-sm">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <h4 class="font-semibold text-base">${escapeHtml(m.name)}</h4>
+          <p class="text-sm text-stone-600 mt-0.5">${escapeHtml(m.description || '')}</p>
+        </div>
+        ${checkboxHtml}
+      </div>
+      <div class="mt-2 flex flex-wrap gap-2 macro text-xs">
+        <span class="pill bg-stone-100 text-stone-700">${macros.kcal || '?'} kcal</span>
+        <span class="pill bg-rose-100 text-rose-800">${macros.protein || '?'}g P</span>
+        <span class="pill bg-amber-100 text-amber-800">${macros.carbs || '?'}g C</span>
+        <span class="pill bg-yellow-100 text-yellow-800">${macros.fat || '?'}g F</span>
+        <span class="pill bg-emerald-100 text-emerald-800">batch of ${m.servings || '?'}</span>
+      </div>
+      ${addonHtml}
+      <details class="mt-3">
+        <summary class="text-sm font-medium text-emerald-700 hover:text-emerald-900">Show ingredients & recipe</summary>
+        <div class="mt-2 text-sm space-y-2">
+          <div>
+            <div class="font-medium text-stone-700">Ingredients (for batch of ${m.servings || '?'}):</div>
+            <ul class="list-disc list-inside text-stone-700">
+              ${(m.ingredients || []).map((i) => `<li>${escapeHtml(i.amount)} ${escapeHtml(i.unit)} ${escapeHtml(i.item)}${i.notes ? ' <span class="text-stone-500">('+escapeHtml(i.notes)+')</span>' : ''}</li>`).join('')}
+            </ul>
+          </div>
+          <div>
+            <div class="font-medium text-stone-700">Instructions:</div>
+            <div class="text-stone-700 recipe-body">${escapeHtml(m.instructions || '')}</div>
+          </div>
+          ${m.prepNotes ? `<div class="text-stone-600 italic">Prep tip: ${escapeHtml(m.prepNotes)}</div>` : ''}
+          ${linkHtml ? `<div>${linkHtml}</div>` : ''}
+        </div>
+      </details>
+    </article>
+  `;
+}
+
+/* ========================================================================== */
+/*  CLAUDE API CALL                                                           */
+/* ========================================================================== */
+async function callClaudeForMeals(userPrompt) {
+  const pA = state.profiles.a, pB = state.profiles.b;
+  const sys = `You are a meal prep planning assistant for a couple who prep meals in bulk once a week.
+
+You must output ONLY a valid JSON object — no prose, no markdown fences, no explanation. The JSON object must match this schema EXACTLY:
+
+{
+  "breakfast": [ Meal, Meal, Meal, Meal, Meal ],
+  "lunch":     [ Meal, Meal, Meal, Meal, Meal ],
+  "dinner":    [ Meal, Meal, Meal, Meal, Meal ],
+  "snack":     [ Meal, Meal, Meal, Meal, Meal ]
+}
+
+Where each Meal is:
+{
+  "name": "short descriptive name",
+  "description": "1-2 sentence description",
+  "servings": <int batch size, typically 4-6 for breakfast/lunch/dinner, 1 for snacks>,
+  "ingredients": [
+    { "item": "lowercase ingredient name", "amount": <number>, "unit": "cup|tbsp|tsp|oz|lb|g|ml|whole|clove|pinch|...", "aisle": "produce|meat|seafood|dairy|eggs|pantry|bakery|frozen|condiments|spices|other", "notes": "optional, e.g. 'boneless skinless'" }
+  ],
+  "instructions": "Step-by-step instructions as one string with numbered steps separated by newlines.",
+  "prepNotes": "1 sentence tip for bulk meal-prepping or storing this dish",
+  "macrosPerServing": { "kcal": <int>, "protein": <int g>, "carbs": <int g>, "fat": <int g> },
+  "carbAddon": null  OR  { "item": "...", "amount": <number>, "unit": "...", "macros": { "kcal":<int>, "protein":<int>, "carbs":<int>, "fat":<int> } },
+  "recipeUrl": null  OR  "https://full-url-to-real-public-recipe.com/..."
+}
+
+Rules:
+- "amount" must be a number (use 0.25, 0.5 etc. for fractions; never strings like "1/4").
+- Provide a "carbAddon" on at least 3 of the 5 lunches and 3 of the 5 dinners so the lower-carb-aversion partner can bulk up their portion. Breakfasts may have add-ons too where it makes sense (e.g., toast, fruit, oats).
+- For "recipeUrl": only include a URL if you have HIGH CONFIDENCE the URL is real and current. If unsure, set to null. Do NOT fabricate URLs. The full recipe should be in "instructions" so the URL is supplementary.
+- Macros must be reasonable and consistent with ingredient amounts.
+- Snacks should be simple, ~150-350 kcal per serving, listed individually (1 serving each).
+- Vary cuisines and techniques across the 5 in each category unless the user prompt requests a specific theme.
+- Optimize for bulk meal prep: dishes that hold up 3-5 days refrigerated.
+- All quantities are TOTAL for the batch (servings × per-serving). Be careful: if servings=5, list 5×per-serving in ingredients.
+
+Output the JSON object and NOTHING ELSE.`;
+
+  const userMsg = `Generate this week's meal plan options.
+
+PERSON A: ${pA.name}
+- ${pA.weightLbs} lbs, ${pA.gender}
+- ${pA.activity}
+- Goal: ${pA.goal}
+- Daily targets: ~${pA.kcalTarget} kcal, ~${pA.proteinTarget}g protein, carbs ${pA.carbRangeLow}-${pA.carbRangeHigh}g
+- Notes: ${pA.notes}
+
+PERSON B: ${pB.name}
+- ${pB.weightLbs} lbs, ${pB.gender}
+- ${pB.activity}
+- Goal: ${pB.goal}
+- Daily targets: ~${pB.kcalTarget} kcal, ~${pB.proteinTarget}g protein, carbs ${pB.carbRangeLow}-${pB.carbRangeHigh}g
+- Notes: ${pB.notes}
+
+GENERAL STYLE NOTES: ${state.styleNotes || '(none)'}
+
+THIS WEEK'S MENU REQUEST: ${userPrompt}
+
+Aim the per-serving macros at Person A's per-meal needs (~1/4 daily kcal for breakfast/lunch/dinner each, snacks ~200 kcal). Person B will eat a smaller portion of the same meal. Use the carbAddon field so Person B can add e.g. rice, tortilla, or fruit without changing the base recipe.
+
+Return ONLY the JSON.`;
+
+  const body = {
+    model: state.model || 'claude-sonnet-4-5',
+    max_tokens: 16000,
+    system: sys,
+    messages: [{ role: 'user', content: userMsg }],
+  };
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': state.apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`API ${res.status}: ${txt.slice(0, 400)}`);
+  }
+  const json = await res.json();
+  const text = (json.content && json.content[0] && json.content[0].text) || '';
+  const parsed = extractJson(text);
+  if (!parsed) throw new Error('Could not parse JSON from Claude response. First 200 chars: ' + text.slice(0, 200));
+
+  // Stamp ids onto each meal
+  ['breakfast','lunch','dinner','snack'].forEach((cat) => {
+    if (!Array.isArray(parsed[cat])) parsed[cat] = [];
+    parsed[cat].forEach((m) => { m.id = uid(); m.category = cat; });
+  });
+  return parsed;
+}
+
+function extractJson(text) {
+  // Try direct parse first
+  try { return JSON.parse(text); } catch {}
+  // Strip code fences
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenced) {
+    try { return JSON.parse(fenced[1]); } catch {}
+  }
+  // Find first { ... last } and try
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first >= 0 && last > first) {
+    try { return JSON.parse(text.slice(first, last + 1)); } catch {}
+  }
+  return null;
+}
+
+/* ========================================================================== */
+/*  VIEW: PICKS (user A picks top 3 in each category)                         */
+/* ========================================================================== */
+function renderPicks(root) {
+  if (!state.lastGeneration) {
+    root.innerHTML = `<div class="bg-amber-50 border border-amber-200 p-4 rounded-md">
+      <p>No meals generated yet. <a href="#generate" class="underline">Generate some first</a>.</p>
+    </div>`;
+    return;
+  }
+  const meals = state.lastGeneration.meals;
+  const order = [
+    ['breakfast', 'Breakfast', '☕'],
+    ['lunch', 'Lunch', '🥙'],
+    ['dinner', 'Dinner', '🍽️'],
+    ['snack', 'Snacks', '🍎'],
+  ];
+  root.innerHTML = `
+    <div class="space-y-5">
+      <header>
+        <h2 class="text-2xl font-semibold">Pick your top 3 in each category</h2>
+        <p class="text-stone-600 mt-1">Select up to 3 favorites per category to send to your partner.</p>
+      </header>
+      ${order.map(([key, label, emoji]) => `
+        <section>
+          <div class="flex items-baseline justify-between mb-3">
+            <h3 class="text-lg font-semibold">${emoji} ${label}</h3>
+            <span class="text-sm text-stone-600" data-count="${key}"></span>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            ${(meals[key] || []).map((m) => mealCard(m, key, true, state.picks[key].includes(m.id))).join('')}
+          </div>
+        </section>
+      `).join('')}
+      <div class="pt-4 border-t border-stone-200 flex gap-3">
+        <a href="#generate" class="px-5 py-2.5 bg-white border border-stone-300 rounded-md hover:bg-stone-100">← Back</a>
+        <button id="go-share" class="px-5 py-2.5 bg-emerald-700 text-white rounded-md font-medium hover:bg-emerald-800">Next: share with partner →</button>
+      </div>
+    </div>
+  `;
+
+  updateCounts();
+
+  document.querySelectorAll('input[data-pick]').forEach((cb) => {
+    cb.onchange = (e) => {
+      const id = cb.getAttribute('data-pick');
+      const cat = cb.getAttribute('data-cat');
+      const picks = state.picks[cat];
+      const i = picks.indexOf(id);
+      if (cb.checked) {
+        if (picks.length >= 3) {
+          cb.checked = false;
+          toast(`You can pick up to 3 ${cat}s — uncheck one first`);
+          return;
+        }
+        if (i < 0) picks.push(id);
+      } else {
+        if (i >= 0) picks.splice(i, 1);
+      }
+      saveState();
+      // Re-render just to update ring styling
+      renderPicks(root);
+    };
+  });
+
+  document.getElementById('go-share').onclick = () => {
+    const allPicked = ['breakfast','lunch','dinner','snack'].every((c) => state.picks[c].length > 0);
+    if (!allPicked) {
+      if (!confirm('You haven\'t picked in every category. Continue anyway?')) return;
+    }
+    go('share');
+  };
+}
+
+function updateCounts() {
+  ['breakfast','lunch','dinner','snack'].forEach((k) => {
+    const el = document.querySelector(`[data-count="${k}"]`);
+    if (el) el.textContent = `${state.picks[k].length} / 3 selected`;
+  });
+}
+
+/* ========================================================================== */
+/*  VIEW: SHARE                                                               */
+/* ========================================================================== */
+function buildShareLink() {
+  // Payload: include only the picked meals (with full recipe data) + profiles + prompt
+  const meals = state.lastGeneration.meals;
+  const picked = {};
+  ['breakfast','lunch','dinner','snack'].forEach((cat) => {
+    picked[cat] = state.picks[cat]
+      .map((id) => (meals[cat] || []).find((m) => m.id === id))
+      .filter(Boolean);
+  });
+  const payload = {
+    v: 1,
+    profiles: state.profiles,
+    prompt: state.lastGeneration.prompt,
+    picks: picked,
+    from: state.profiles.a.name,
+  };
+  const compressed = LZString.compressToEncodedURIComponent(JSON.stringify(payload));
+  const url = location.origin + location.pathname + '#review?d=' + compressed;
+  return { url, compressed };
+}
+
+function renderShare(root) {
+  if (!state.lastGeneration) {
+    root.innerHTML = `<div class="bg-amber-50 border border-amber-200 p-4 rounded-md">
+      <p>No meals generated yet. <a href="#generate" class="underline">Generate some first</a>.</p>
+    </div>`;
+    return;
+  }
+  const { url, compressed } = buildShareLink();
+  const counts = ['breakfast','lunch','dinner','snack'].map((c) => state.picks[c].length);
+
+  root.innerHTML = `
+    <div class="space-y-5">
+      <header>
+        <h2 class="text-2xl font-semibold">Share with your partner</h2>
+        <p class="text-stone-600 mt-1">Send your partner this link. When they open it, they'll see your top picks and can finalize the plan.</p>
+      </header>
+
+      <section class="bg-white p-5 rounded-lg border border-stone-200">
+        <div class="text-sm text-stone-600 mb-3">Your picks: ${counts[0]} breakfast, ${counts[1]} lunch, ${counts[2]} dinner, ${counts[3]} snack.</div>
+
+        <label class="block text-sm font-medium text-stone-700 mb-1">Shareable link</label>
+        <div class="flex gap-2">
+          <input id="share-url" readonly value="${escapeHtml(url)}" class="flex-1 px-3 py-2 border border-stone-300 rounded-md font-mono text-xs bg-stone-50">
+          <button id="copy-link" class="px-4 py-2 bg-emerald-700 text-white rounded-md hover:bg-emerald-800 text-sm">Copy</button>
+        </div>
+        <p class="text-xs text-stone-500 mt-2">Length: ${url.length} chars. If your messaging app trims it, use the short code below instead.</p>
+
+        <label class="block text-sm font-medium text-stone-700 mt-4 mb-1">Or copy this code (paste it into the partner's app)</label>
+        <textarea id="share-code" readonly class="w-full px-3 py-2 border border-stone-300 rounded-md font-mono text-xs bg-stone-50" rows="4">${escapeHtml(compressed)}</textarea>
+        <button id="copy-code" class="mt-2 px-4 py-2 bg-white border border-stone-300 rounded-md text-sm hover:bg-stone-100">Copy code</button>
+      </section>
+
+      <section class="bg-white p-5 rounded-lg border border-stone-200">
+        <h3 class="font-semibold mb-2">Receiving picks from your partner?</h3>
+        <p class="text-sm text-stone-600 mb-2">If they sent you a code instead of a link, paste it here:</p>
+        <textarea id="paste-code" placeholder="Paste code..." rows="3" class="w-full px-3 py-2 border border-stone-300 rounded-md font-mono text-xs"></textarea>
+        <button id="open-paste" class="mt-2 px-4 py-2 bg-emerald-700 text-white rounded-md text-sm hover:bg-emerald-800">Open</button>
+      </section>
+
+      <div class="pt-4 border-t border-stone-200 flex gap-3">
+        <a href="#picks" class="px-5 py-2.5 bg-white border border-stone-300 rounded-md hover:bg-stone-100">← Back to picks</a>
+        <button id="self-review" class="px-5 py-2.5 bg-stone-800 text-white rounded-md hover:bg-stone-900">Or finalize myself →</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('copy-link').onclick = () => copyToClipboard(url);
+  document.getElementById('copy-code').onclick = () => copyToClipboard(compressed);
+  document.getElementById('self-review').onclick = () => go('review', { d: compressed });
+  document.getElementById('open-paste').onclick = () => {
+    const code = document.getElementById('paste-code').value.trim();
+    if (!code) { toast('Paste a code first'); return; }
+    go('review', { d: code });
+  };
+}
+
+/* ========================================================================== */
+/*  VIEW: REVIEW (partner finalizes)                                          */
+/* ========================================================================== */
+function decodeShare(d) {
+  try {
+    const json = LZString.decompressFromEncodedURIComponent(d);
+    if (!json) return null;
+    return JSON.parse(json);
+  } catch (e) {
+    return null;
+  }
+}
+
+function renderReview(root, encodedData) {
+  if (!encodedData) {
+    root.innerHTML = `<div class="bg-amber-50 border border-amber-200 p-4 rounded-md">
+      <p>No data in URL. <a href="#share" class="underline">Go to share screen</a> to paste a code.</p>
+    </div>`;
+    return;
+  }
+  const payload = decodeShare(encodedData);
+  if (!payload) {
+    root.innerHTML = `<div class="bg-red-50 border border-red-200 p-4 rounded-md">
+      <p>Could not decode share link. It may be corrupted.</p>
+    </div>`;
+    return;
+  }
+
+  // Initialize / preserve finalPlan state for this payload
+  if (!state.finalPlan || state.finalPlan.encoded !== encodedData) {
+    const fp = {
+      encoded: encodedData,
+      from: payload.from,
+      profiles: payload.profiles,
+      prompt: payload.prompt,
+      picks: payload.picks,
+      // For each meal across categories: { selected, servingsA, servingsB, addonForB }
+      selections: {},
+    };
+    ['breakfast','lunch','dinner','snack'].forEach((cat) => {
+      (payload.picks[cat] || []).forEach((m) => {
+        const defaultServA = cat === 'snack' ? 5 : 5;
+        const defaultServB = cat === 'snack' ? 5 : 5;
+        fp.selections[m.id] = {
+          selected: true,
+          servingsA: defaultServA,
+          servingsB: defaultServB,
+          addonForB: !!m.carbAddon,
+          addonForA: false,
+        };
+      });
+    });
+    state.finalPlan = fp;
+    saveState();
+  }
+
+  const fp = state.finalPlan;
+  const order = [
+    ['breakfast', 'Breakfast', '☕'],
+    ['lunch', 'Lunch', '🥙'],
+    ['dinner', 'Dinner', '🍽️'],
+    ['snack', 'Snacks', '🍎'],
+  ];
+
+  root.innerHTML = `
+    <div class="space-y-5">
+      <header>
+        <h2 class="text-2xl font-semibold">Finalize the plan</h2>
+        <p class="text-stone-600 mt-1">${escapeHtml(payload.from || 'Partner')} picked these. Choose which ones to actually cook, set servings per person, and toggle carb add-ons.</p>
+        <div class="mt-2 text-sm text-stone-500">Original prompt: <em>"${escapeHtml(payload.prompt || '')}"</em></div>
+      </header>
+
+      ${order.map(([key, label, emoji]) => {
+        const items = (payload.picks[key] || []);
+        if (items.length === 0) return '';
+        return `
+          <section>
+            <h3 class="text-lg font-semibold mb-3">${emoji} ${label}</h3>
+            <div class="space-y-3">
+              ${items.map((m) => reviewMealCard(m, key, fp.selections[m.id], fp.profiles)).join('')}
+            </div>
+          </section>
+        `;
+      }).join('')}
+
+      <div class="pt-4 border-t border-stone-200 flex gap-3">
+        <button id="build-shopping" class="px-5 py-2.5 bg-emerald-700 text-white rounded-md font-medium hover:bg-emerald-800">Generate shopping list →</button>
+      </div>
+    </div>
+  `;
+
+  // Wire up controls
+  document.querySelectorAll('[data-sel]').forEach((el) => {
+    el.onchange = (e) => {
+      const id = el.getAttribute('data-sel');
+      const field = el.getAttribute('data-field');
+      const sel = fp.selections[id];
+      if (!sel) return;
+      if (field === 'selected' || field === 'addonForA' || field === 'addonForB') {
+        sel[field] = el.checked;
+      } else {
+        sel[field] = Math.max(0, Number(el.value) || 0);
+      }
+      saveState();
+    };
+  });
+
+  document.getElementById('build-shopping').onclick = () => {
+    saveState();
+    go('shopping');
+  };
+}
+
+function reviewMealCard(m, category, sel, profiles) {
+  if (!sel) return '';
+  const macros = m.macrosPerServing || {};
+  const checked = sel.selected ? 'checked' : '';
+  const nameA = profiles?.a?.name || 'Person A';
+  const nameB = profiles?.b?.name || 'Person B';
+  return `
+    <article class="rounded-lg border border-stone-200 bg-white p-4 ${sel.selected ? '' : 'opacity-60'}">
+      <div class="flex items-start gap-3">
+        <input type="checkbox" data-sel="${m.id}" data-field="selected" ${checked} class="w-5 h-5 mt-1 accent-emerald-600">
+        <div class="flex-1">
+          <div class="flex items-baseline justify-between gap-3">
+            <h4 class="font-semibold">${escapeHtml(m.name)}</h4>
+            <span class="text-xs text-stone-500">${macros.kcal||'?'} kcal · ${macros.protein||'?'}g P · ${macros.carbs||'?'}g C · ${macros.fat||'?'}g F per serving</span>
+          </div>
+          <p class="text-sm text-stone-600">${escapeHtml(m.description || '')}</p>
+
+          <div class="mt-3 grid grid-cols-2 gap-3 text-sm">
+            <label>Servings for ${escapeHtml(nameA)}<br>
+              <input type="number" min="0" data-sel="${m.id}" data-field="servingsA" value="${sel.servingsA}" class="w-24 mt-1 px-2 py-1 border border-stone-300 rounded">
+            </label>
+            <label>Servings for ${escapeHtml(nameB)}<br>
+              <input type="number" min="0" data-sel="${m.id}" data-field="servingsB" value="${sel.servingsB}" class="w-24 mt-1 px-2 py-1 border border-stone-300 rounded">
+            </label>
+          </div>
+
+          ${m.carbAddon ? `
+            <div class="mt-3 text-sm bg-amber-50 border border-amber-200 p-2 rounded">
+              <div class="font-medium">Optional carb add-on per serving:</div>
+              <div class="text-stone-700">${escapeHtml(m.carbAddon.amount)} ${escapeHtml(m.carbAddon.unit)} ${escapeHtml(m.carbAddon.item)} (+${m.carbAddon.macros?.kcal||0} kcal, +${m.carbAddon.macros?.carbs||0}g C)</div>
+              <div class="mt-2 flex gap-4">
+                <label class="flex items-center gap-1"><input type="checkbox" data-sel="${m.id}" data-field="addonForA" ${sel.addonForA?'checked':''} class="accent-emerald-600"> Add for ${escapeHtml(nameA)}</label>
+                <label class="flex items-center gap-1"><input type="checkbox" data-sel="${m.id}" data-field="addonForB" ${sel.addonForB?'checked':''} class="accent-emerald-600"> Add for ${escapeHtml(nameB)}</label>
+              </div>
+            </div>
+          ` : ''}
+
+          <details class="mt-3">
+            <summary class="text-sm text-emerald-700 font-medium">View recipe</summary>
+            <div class="mt-2 text-sm">
+              <div class="font-medium">Ingredients (batch of ${m.servings || '?'}):</div>
+              <ul class="list-disc list-inside text-stone-700">
+                ${(m.ingredients || []).map((i) => `<li>${escapeHtml(i.amount)} ${escapeHtml(i.unit)} ${escapeHtml(i.item)}</li>`).join('')}
+              </ul>
+              <div class="font-medium mt-2">Instructions:</div>
+              <div class="text-stone-700 recipe-body">${escapeHtml(m.instructions || '')}</div>
+              ${m.recipeUrl ? `<a href="${escapeHtml(m.recipeUrl)}" target="_blank" class="text-emerald-700 underline">Recipe link ↗</a>` : ''}
+            </div>
+          </details>
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+/* ========================================================================== */
+/*  VIEW: SHOPPING LIST                                                       */
+/* ========================================================================== */
+function renderShopping(root) {
+  const fp = state.finalPlan;
+  if (!fp) {
+    root.innerHTML = `<div class="bg-amber-50 border border-amber-200 p-4 rounded-md">
+      <p>No finalized plan yet. <a href="#share" class="underline">Go finalize the plan first</a>.</p>
+    </div>`;
+    return;
+  }
+
+  const { groups, totalMacros, selectedMeals } = aggregateShoppingList(fp);
+  const nameA = fp.profiles?.a?.name || state.profiles.a.name || 'Person A';
+  const nameB = fp.profiles?.b?.name || state.profiles.b.name || 'Person B';
+
+  // Build groups in a fixed aisle order
+  const aisleOrder = ['produce', 'meat', 'seafood', 'dairy', 'eggs', 'bakery', 'pantry', 'spices', 'frozen', 'condiments', 'other'];
+  const orderedGroups = aisleOrder
+    .map((a) => [a, groups[a]])
+    .filter(([a, items]) => items && items.length > 0);
+
+  root.innerHTML = `
+    <div class="space-y-5">
+      <header class="flex items-start justify-between gap-3">
+        <div>
+          <h2 class="text-2xl font-semibold">Shopping list</h2>
+          <p class="text-stone-600 mt-1">${selectedMeals.length} meals selected. Check items off as you shop, or copy the list to paste into Instacart.</p>
+        </div>
+        <div class="flex gap-2 no-print">
+          <button id="copy-list" class="px-4 py-2 bg-emerald-700 text-white rounded-md text-sm hover:bg-emerald-800">Copy for Instacart</button>
+          <button id="print-list" class="px-4 py-2 bg-white border border-stone-300 rounded-md text-sm hover:bg-stone-100">Print</button>
+        </div>
+      </header>
+
+      <section class="bg-white p-4 rounded-lg border border-stone-200 text-sm">
+        <div class="font-semibold mb-2">Plan summary</div>
+        <ul class="list-disc list-inside text-stone-700">
+          ${selectedMeals.map((m) => {
+            const sel = fp.selections[m.id];
+            const aServ = sel.servingsA, bServ = sel.servingsB;
+            return `<li><strong>${escapeHtml(m.name)}</strong> — ${aServ} servings for ${escapeHtml(nameA)}, ${bServ} servings for ${escapeHtml(nameB)}${sel.addonForA||sel.addonForB ? ' (with add-on)' : ''}</li>`;
+          }).join('')}
+        </ul>
+        <div class="mt-3 grid grid-cols-2 gap-2 text-stone-600">
+          <div>${escapeHtml(nameA)} total: ${round(totalMacros.a.kcal)} kcal · ${round(totalMacros.a.protein)}g P · ${round(totalMacros.a.carbs)}g C · ${round(totalMacros.a.fat)}g F</div>
+          <div>${escapeHtml(nameB)} total: ${round(totalMacros.b.kcal)} kcal · ${round(totalMacros.b.protein)}g P · ${round(totalMacros.b.carbs)}g C · ${round(totalMacros.b.fat)}g F</div>
+        </div>
+        <div class="mt-2 text-xs text-stone-500">Totals across all selected servings. Daily kcal target: ${escapeHtml(nameA)} ${state.profiles.a.kcalTarget || '?'}, ${escapeHtml(nameB)} ${state.profiles.b.kcalTarget || '?'}.</div>
+      </section>
+
+      ${orderedGroups.map(([aisle, items]) => `
+        <section class="bg-white p-4 rounded-lg border border-stone-200">
+          <h3 class="font-semibold text-stone-800 mb-2 capitalize">${aisle}</h3>
+          <ul class="space-y-1">
+            ${items.map((it) => {
+              const key = `${aisle}::${it.item}::${it.unit}`;
+              const checked = state.checkedItems[key] ? 'checked' : '';
+              const lineThrough = state.checkedItems[key] ? 'line-through text-stone-400' : '';
+              const amt = it.unit === 'whole' || it.unit === '' ? round(it.amount, 1) : round(it.amount, 2);
+              return `<li class="flex items-center gap-2">
+                <input type="checkbox" data-key="${escapeHtml(key)}" ${checked} class="w-4 h-4 accent-emerald-600">
+                <span class="${lineThrough}"><strong>${amt} ${escapeHtml(it.unit)}</strong> ${escapeHtml(it.item)}</span>
+              </li>`;
+            }).join('')}
+          </ul>
+        </section>
+      `).join('')}
+
+      <div class="pt-4 border-t border-stone-200 flex gap-3 no-print">
+        <a href="#review?d=${fp.encoded}" class="px-5 py-2.5 bg-white border border-stone-300 rounded-md hover:bg-stone-100">← Back to finalize</a>
+        <button id="reset-check" class="px-5 py-2.5 bg-white border border-stone-300 rounded-md hover:bg-stone-100 text-sm">Uncheck all</button>
+      </div>
+    </div>
+  `;
+
+  document.querySelectorAll('input[data-key]').forEach((cb) => {
+    cb.onchange = () => {
+      const k = cb.getAttribute('data-key');
+      state.checkedItems[k] = cb.checked;
+      saveState();
+      // Toggle strikethrough without full re-render
+      const span = cb.parentElement.querySelector('span');
+      if (span) span.classList.toggle('line-through');
+      if (span) span.classList.toggle('text-stone-400');
+    };
+  });
+
+  document.getElementById('copy-list').onclick = () => {
+    const text = buildInstacartText(orderedGroups);
+    copyToClipboard(text);
+  };
+  document.getElementById('print-list').onclick = () => window.print();
+  document.getElementById('reset-check').onclick = () => {
+    state.checkedItems = {};
+    saveState();
+    render();
+  };
+}
+
+function aggregateShoppingList(fp) {
+  const groups = {}; // aisle -> [{ item, unit, amount }]
+  const totalMacros = {
+    a: { kcal:0, protein:0, carbs:0, fat:0 },
+    b: { kcal:0, protein:0, carbs:0, fat:0 },
+  };
+  const selectedMeals = [];
+
+  const addIng = (item, amount, unit, aisle) => {
+    aisle = (aisle || 'other').toLowerCase();
+    item = (item || '').toLowerCase().trim();
+    unit = (unit || '').toLowerCase().trim();
+    if (!item || !Number.isFinite(amount)) return;
+    if (!groups[aisle]) groups[aisle] = [];
+    const existing = groups[aisle].find((x) => x.item === item && x.unit === unit);
+    if (existing) existing.amount += amount;
+    else groups[aisle].push({ item, unit, amount });
+  };
+
+  const allMeals = []
+    .concat(fp.picks.breakfast || [])
+    .concat(fp.picks.lunch || [])
+    .concat(fp.picks.dinner || [])
+    .concat(fp.picks.snack || []);
+
+  allMeals.forEach((m) => {
+    const sel = fp.selections[m.id];
+    if (!sel || !sel.selected) return;
+    selectedMeals.push(m);
+    const servingsTotal = (sel.servingsA || 0) + (sel.servingsB || 0);
+    const batchServings = Math.max(1, m.servings || 1);
+    const scale = servingsTotal / batchServings; // multiplier on the recipe-as-written
+
+    (m.ingredients || []).forEach((i) => {
+      const amt = Number(i.amount) || 0;
+      addIng(i.item, amt * scale, i.unit, i.aisle);
+    });
+
+    // Carb addons (per serving × that person's servings)
+    if (m.carbAddon) {
+      const addonServings = (sel.addonForA ? sel.servingsA : 0) + (sel.addonForB ? sel.servingsB : 0);
+      if (addonServings > 0) {
+        const a = m.carbAddon;
+        addIng(a.item, (Number(a.amount) || 0) * addonServings, a.unit, 'pantry');
+      }
+    }
+
+    // Accumulate macros
+    const macros = m.macrosPerServing || {};
+    ['kcal','protein','carbs','fat'].forEach((k) => {
+      totalMacros.a[k] += (macros[k] || 0) * (sel.servingsA || 0);
+      totalMacros.b[k] += (macros[k] || 0) * (sel.servingsB || 0);
+    });
+    if (m.carbAddon && m.carbAddon.macros) {
+      const am = m.carbAddon.macros;
+      ['kcal','protein','carbs','fat'].forEach((k) => {
+        if (sel.addonForA) totalMacros.a[k] += (am[k] || 0) * (sel.servingsA || 0);
+        if (sel.addonForB) totalMacros.b[k] += (am[k] || 0) * (sel.servingsB || 0);
+      });
+    }
+  });
+
+  // Sort each aisle alphabetically
+  Object.keys(groups).forEach((a) => groups[a].sort((x, y) => x.item.localeCompare(y.item)));
+
+  return { groups, totalMacros, selectedMeals };
+}
+
+function buildInstacartText(orderedGroups) {
+  const lines = [];
+  orderedGroups.forEach(([aisle, items]) => {
+    items.forEach((it) => {
+      const amt = it.unit === 'whole' || it.unit === '' ? round(it.amount, 1) : round(it.amount, 2);
+      lines.push(`${amt} ${it.unit} ${it.item}`.trim());
+    });
+  });
+  return lines.join('\n');
+}
+
+/* ========================================================================== */
+/*  BOOT                                                                      */
+/* ========================================================================== */
+// If we landed on the page from a share link straight to #review, that's fine.
+// Otherwise default to #setup.
+if (!location.hash) location.hash = 'setup';
+render();
+</script>
+</body>
+</html>
