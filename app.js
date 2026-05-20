@@ -37,6 +37,8 @@ const defaultState = () => ({
   includeFavoritesInGen: false,
   finalPlan: null,
   checkedItems: {},
+  scaledRecipes: {},        // mealId -> { targetServings, name, ingredients, instructions, prepNotes }
+  consolidatedShopping: {}, // { hash, items: [...] }
 });
 
 let state = loadState();
@@ -107,7 +109,7 @@ function render() {
   if (route === 'share')     return renderShare(app);
   if (route === 'review')    return renderReview(app, params.d, params.u);
   if (route === 'shopping')  return renderShopping(app, params.d, params.p);
-  if (route === 'recipes')   return renderRecipes(app);
+  if (route === 'recipes')   return renderRecipes(app, params.d, params.p);
   if (route === 'favorites') return renderFavorites(app);
   if (route === 'pantry')    return renderPantry(app);
 }

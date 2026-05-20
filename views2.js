@@ -173,13 +173,17 @@ function buildFinalPlanPayload() {
   const fp = state.finalPlan; if (!fp) return null;
   return { v: 2, kind: 'finalPlan', from: state.profiles.a.name, profiles: fp.profiles, prompt: fp.prompt,
            picks: fp.picks, selections: fp.selections, weeklyExtrasA: fp.weeklyExtrasA,
-           weeklyExtrasB: fp.weeklyExtrasB, pantryStaples: fp.pantryStaples };
+           weeklyExtrasB: fp.weeklyExtrasB, pantryStaples: fp.pantryStaples,
+           scaledRecipes: state.scaledRecipes || {},
+           consolidatedShopping: state.consolidatedShopping || {} };
 }
 function applyIncomingFinalPlan(payload, encoded) {
   state.finalPlan = { encoded, from: payload.from, profiles: payload.profiles, prompt: payload.prompt,
                       picks: payload.picks, selections: payload.selections || {},
                       weeklyExtrasA: payload.weeklyExtrasA || [], weeklyExtrasB: payload.weeklyExtrasB || [],
                       pantryStaples: payload.pantryStaples || state.pantryStaples };
+  if (payload.scaledRecipes && typeof payload.scaledRecipes === 'object') state.scaledRecipes = payload.scaledRecipes;
+  if (payload.consolidatedShopping && typeof payload.consolidatedShopping === 'object') state.consolidatedShopping = payload.consolidatedShopping;
   saveState();
 }
 function renderShopping(root, encodedD, shortP) {
@@ -219,7 +223,28 @@ function renderShopping(root, encodedD, shortP) {
   const { groups, totalMacros, selectedMeals } = aggregateShoppingList(fp, auto);
   const nameA = fp.profiles?.a?.name || 'Person A', nameB = fp.profiles?.b?.name || 'Person B';
   const aisleOrder = ['produce','meat','seafood','dairy','eggs','bakery','pantry','spices','frozen','condiments','other'];
-  const orderedGroups = aisleOrder.map(a => [a, groups[a]]).filter(([a,it]) => it && it.length > 0);
+
+  const consolHash = hashShoppingInput(groups);
+  let orderedGroups, isConsolidated = false;
+  const consol = state.consolidatedShopping;
+  if (consol && consol.hash === consolHash && Array.isArray(consol.items) && consol.items.length > 0) {
+    const cg = {};
+    consol.items.forEach(it => {
+      const a = (it.aisle || 'other').toLowerCase();
+      if (!cg[a]) cg[a] = [];
+      cg[a].push({
+        item: (it.item || '').toLowerCase().trim(),
+        unit: (it.unit || '').toLowerCase().trim(),
+        amount: Number(it.amount) || 0,
+        source: 'consolidated',
+      });
+    });
+    Object.keys(cg).forEach(a => cg[a].sort((x,y) => x.item.localeCompare(y.item)));
+    orderedGroups = aisleOrder.map(a => [a, cg[a]]).filter(([a,it]) => it && it.length > 0);
+    isConsolidated = true;
+  } else {
+    orderedGroups = aisleOrder.map(a => [a, groups[a]]).filter(([a,it]) => it && it.length > 0);
+  }
 
   root.innerHTML = `<div class="space-y-5">
     <header class="flex items-start justify-between gap-3 flex-wrap">
@@ -227,8 +252,12 @@ function renderShopping(root, encodedD, shortP) {
         <p class="text-stone-600 mt-1">${selectedMeals.length} meals selected. Includes pantry staples and added items.</p></div>
       <div class="flex gap-2 no-print flex-wrap">
         <a href="#recipes" class="px-4 py-2 bg-white border border-stone-300 rounded-md text-sm hover:bg-stone-100">📖 View recipes</a>
-        <button id="share-shopping" class="px-4 py-2 bg-emerald-700 text-white rounded-md text-sm hover:bg-emerald-800">📤 Share with partner</button>
-        <button id="copy-list" class="px-4 py-2 bg-stone-700 text-white rounded-md text-sm hover:bg-stone-800">Copy for Instacart</button>
+        <button id="share-shopping" class="px-4 py-2 bg-emerald-700 text-white rounded-md text-sm hover:bg-emerald-800">📤 Share</button>
+        <button id="consolidate-list" class="px-4 py-2 ${isConsolidated?'bg-emerald-100 text-emerald-800 border border-emerald-300':'bg-amber-600 text-white hover:bg-amber-700'} rounded-md text-sm flex items-center gap-2">
+          <span id="consol-spinner" class="hidden"><span class="spinner"></span></span>
+          <span id="consol-label">${isConsolidated ? '✓ Consolidated · Refresh' : '✨ Consolidate units'}</span>
+        </button>
+        <button id="copy-list" class="px-4 py-2 bg-stone-700 text-white rounded-md text-sm hover:bg-stone-800">Copy as text</button>
         <button id="print-list" class="px-4 py-2 bg-white border border-stone-300 rounded-md text-sm hover:bg-stone-100">Print</button>
       </div>
     </header>
@@ -274,9 +303,11 @@ function renderShopping(root, encodedD, shortP) {
         const lt = state.checkedItems[key] ? 'line-through text-stone-400' : '';
         const amt = it.unit === 'whole' || it.unit === '' ? round(it.amount, 1) : round(it.amount, 2);
         const tag = it.source ? `<span class="text-xs text-stone-400 ml-1">(${it.source})</span>` : '';
+        const icUrl = `https://www.instacart.com/store/s?k=${encodeURIComponent(it.item)}`;
         return `<li class="flex items-center gap-2">
           <input type="checkbox" data-key="${escapeHtml(key)}" ${checked} class="w-4 h-4 accent-emerald-600">
-          <span class="${lt}"><strong>${amt} ${escapeHtml(it.unit)}</strong> ${escapeHtml(it.item)}</span>${tag}</li>`;
+          <span class="${lt}"><strong>${amt} ${escapeHtml(it.unit)}</strong> ${escapeHtml(it.item)}</span>
+          <a href="${icUrl}" target="_blank" rel="noopener" class="text-sm text-emerald-700 hover:text-emerald-900 no-print" title="Search '${escapeHtml(it.item)}' on Instacart">🛒</a>${tag}</li>`;
       }).join('')}</ul></section>`).join('')}
     <div class="pt-4 border-t border-stone-200 flex gap-3 no-print">
       <a href="#review?d=${fp.encoded}" class="px-5 py-2.5 bg-white border border-stone-300 rounded-md hover:bg-stone-100">← Back to finalize</a>
@@ -293,6 +324,22 @@ function renderShopping(root, encodedD, shortP) {
   document.getElementById('copy-list').onclick = () => copyToClipboard(buildInstacartText(orderedGroups));
   document.getElementById('print-list').onclick = () => window.print();
   document.getElementById('reset-check').onclick = () => { state.checkedItems = {}; saveState(); render(); };
+  document.getElementById('consolidate-list').onclick = async () => {
+    if (!state.apiKey) { toast('Set your API key in Setup first'); return; }
+    const sp = document.getElementById('consol-spinner'), lbl = document.getElementById('consol-label');
+    sp.classList.remove('hidden'); lbl.textContent = 'Consolidating…';
+    try {
+      const flat = [];
+      Object.keys(groups).forEach(aisle => (groups[aisle] || []).forEach(it => flat.push({
+        item: it.item, amount: round(it.amount, 3), unit: it.unit, aisle,
+      })));
+      const consolidated = await callClaudeForConsolidatedList(flat);
+      state.consolidatedShopping = { hash: consolHash, items: consolidated };
+      saveState();
+      toast('Consolidated — ' + consolidated.length + ' items'); render();
+    } catch (e) { toast('Error: ' + e.message); console.error(e); }
+    finally { sp.classList.add('hidden'); lbl.textContent = isConsolidated ? '✓ Consolidated · Refresh' : '✨ Consolidate units'; }
+  };
   const sharePanel = document.getElementById('share-shopping-panel');
   document.getElementById('share-shopping').onclick = () => {
     sharePanel.classList.toggle('hidden');
@@ -323,6 +370,16 @@ function renderShopping(root, encodedD, shortP) {
     finally { sp.classList.add('hidden'); lbl.textContent = 'Generate short link'; }
   };
 }
+function hashShoppingInput(groups) {
+  const flat = [];
+  Object.keys(groups).sort().forEach(aisle => {
+    (groups[aisle] || []).forEach(it => {
+      flat.push(`${aisle}|${it.item}|${it.unit}|${(Number(it.amount) || 0).toFixed(3)}`);
+    });
+  });
+  return flat.join('\n');
+}
+
 function aggregateShoppingList(fp, autoServings) {
   const groups = {}; const totalMacros = { a:{kcal:0,protein:0,carbs:0,fat:0}, b:{kcal:0,protein:0,carbs:0,fat:0} };
   const selectedMeals = [];
@@ -418,25 +475,103 @@ function recipesViewMeals() {
   }
   return { meals: [], label: '' };
 }
-function renderRecipes(root) {
+function renderRecipes(root, encodedD, shortP) {
+  // Cross-device sharing: fetch finalPlan from URL params if needed
+  if (shortP && (!state.finalPlan || state.finalPlan.encoded !== '__SHORT__' + shortP)) {
+    root.innerHTML = `<div class="text-stone-600 flex items-center gap-2"><span class="spinner"></span> Fetching shared recipes…</div>`;
+    fetchFromPasteService(shortP).then(compressed => {
+      const payload = decodeShare(compressed);
+      if (!payload) { root.innerHTML = `<div class="bg-red-50 border border-red-200 p-4 rounded-md">Could not decode.</div>`; return; }
+      applyIncomingFinalPlan(payload, '__SHORT__' + shortP);
+      renderRecipes(root);
+    }).catch(e => { root.innerHTML = `<div class="bg-red-50 border border-red-200 p-4 rounded-md">Could not fetch: ${escapeHtml(e.message)}</div>`; });
+    return;
+  }
+  if (encodedD && (!state.finalPlan || state.finalPlan.encoded !== encodedD)) {
+    const payload = decodeShare(encodedD);
+    if (payload && payload.kind === 'finalPlan') applyIncomingFinalPlan(payload, encodedD);
+    else { root.innerHTML = `<div class="bg-red-50 border border-red-200 p-4 rounded-md">Could not decode recipes link.</div>`; return; }
+  }
+
   const { meals, label } = recipesViewMeals();
   if (meals.length === 0) {
     root.innerHTML = `<div class="bg-amber-50 border border-amber-200 p-4 rounded-md"><p>No recipes to show yet. <a href="#generate" class="underline">Generate meals</a>, pick some, or finalize a plan.</p></div>`;
     return;
   }
+
+  // Compute target servings per meal (only meaningful if finalPlan exists)
+  const fp = state.finalPlan;
+  const targetServings = {};
+  let canScale = false;
+  if (fp) {
+    const autoSrv = autoServingsForFinalPlan(fp);
+    meals.forEach(({ meal }) => {
+      const a = getEffectiveServings(fp, autoSrv, meal.id, 'a');
+      const b = getEffectiveServings(fp, autoSrv, meal.id, 'b');
+      targetServings[meal.id] = a + b;
+    });
+    canScale = true;
+  }
+
+  // Which meals need scaling (no cached scaled version, or target servings changed)
+  const needsScaling = canScale ? meals.filter(({ meal }) => {
+    const t = targetServings[meal.id]; if (!t || t <= 0) return false;
+    const cached = state.scaledRecipes?.[meal.id];
+    return !cached || cached.targetServings !== t;
+  }) : [];
+  const scaledCount = canScale ? meals.filter(({ meal }) => {
+    const t = targetServings[meal.id]; if (!t || t <= 0) return false;
+    const cached = state.scaledRecipes?.[meal.id];
+    return cached && cached.targetServings === t;
+  }).length : 0;
+
   const catLabels = { breakfast:'☕ Breakfast', lunch:'🥙 Lunch', dinner:'🍽️ Dinner', snack:'🍎 Snacks' };
+
+  const scaleBannerHtml = (() => {
+    if (!canScale) return `<div class="bg-stone-50 border border-stone-200 p-3 rounded text-sm text-stone-600 no-print">
+      ℹ️ Recipe scaling is available after you finalize a plan (when you know each person's target servings).
+    </div>`;
+    if (needsScaling.length === 0 && scaledCount > 0) return `<div class="bg-emerald-50 border border-emerald-200 p-3 rounded text-sm flex items-center justify-between gap-3 no-print">
+      <span class="text-emerald-800">✓ All ${scaledCount} recipe${scaledCount===1?' is':'s are'} scaled to this week's servings.</span>
+      <button id="rescale-all" class="text-xs px-3 py-1 bg-white border border-emerald-300 text-emerald-700 rounded hover:bg-emerald-50">Re-scale</button>
+    </div>`;
+    return `<div class="bg-amber-50 border border-amber-200 p-3 rounded text-sm flex items-center justify-between gap-3 flex-wrap no-print">
+      <div class="text-amber-900">
+        ${needsScaling.length} recipe${needsScaling.length===1?'':'s'} ${needsScaling.length===1?'is':'are'} unscaled (still shows original batch sizes).
+      </div>
+      <button id="scale-all" class="px-3 py-1.5 bg-amber-600 text-white rounded text-sm hover:bg-amber-700 flex items-center gap-2">
+        <span id="scale-spinner" class="hidden"><span class="spinner"></span></span>
+        <span id="scale-label">✨ Scale to weekly servings</span>
+      </button>
+    </div>`;
+  })();
+
   root.innerHTML = `<div class="space-y-5">
     <header class="flex items-start justify-between gap-3 flex-wrap">
       <div><h2 class="text-2xl font-semibold">📖 Recipes</h2>
         <p class="text-stone-600 mt-1">Full ingredients & instructions for ${label} (${meals.length} recipe${meals.length===1?'':'s'}). Click ✎ to save a website link to a recipe.</p></div>
-      <div class="flex gap-2 no-print">
-        <button id="print-recipes" class="px-4 py-2 bg-emerald-700 text-white rounded-md text-sm hover:bg-emerald-800">Print all</button>
+      <div class="flex gap-2 no-print flex-wrap">
+        ${fp ? `<button id="share-recipes" class="px-4 py-2 bg-emerald-700 text-white rounded-md text-sm hover:bg-emerald-800">📤 Share recipes</button>` : ''}
+        <button id="print-recipes" class="px-4 py-2 bg-stone-700 text-white rounded-md text-sm hover:bg-stone-800">Print all</button>
       </div></header>
+    ${scaleBannerHtml}
+    <section id="share-recipes-panel" class="bg-white p-4 rounded-lg border border-stone-200 hidden no-print">
+      <h3 class="font-semibold mb-2">Share these recipes</h3>
+      <p class="text-sm text-stone-600 mb-3">Generates a link that opens directly to this recipes view (with scaled versions if you've scaled them). Same payload as the shopping share — your partner can navigate to either.</p>
+      <div class="flex gap-2 items-center">
+        <button id="make-short-rec" class="px-4 py-2 bg-emerald-700 text-white rounded-md text-sm hover:bg-emerald-800 flex items-center gap-2">
+          <span id="short-rec-spinner" class="hidden"><span class="spinner"></span></span>
+          <span id="short-rec-label">Generate short link</span>
+        </button>
+        <span id="short-rec-status" class="text-sm text-stone-600"></span>
+      </div>
+      <div id="short-rec-result" class="mt-3"></div>
+    </section>
     ${['breakfast','lunch','dinner','snack'].map(cat => {
       const items = meals.filter(x => x.category === cat);
       if (items.length === 0) return '';
       return `<section><h3 class="text-lg font-semibold mb-3 mt-2 border-b border-stone-200 pb-1">${catLabels[cat]}</h3>
-        <div class="space-y-5">${items.map(x => recipeCard(x.meal)).join('')}</div></section>`;
+        <div class="space-y-5">${items.map(x => recipeCard(x.meal, targetServings[x.meal.id])).join('')}</div></section>`;
     }).join('')}
   </div>`;
   document.getElementById('print-recipes').onclick = () => window.print();
@@ -459,15 +594,111 @@ function renderRecipes(root) {
       renderRecipes(root);
     };
   });
+  // Toggle original/scaled per recipe
+  document.querySelectorAll('[data-toggle-orig]').forEach(btn => {
+    btn.onclick = () => {
+      const id = btn.getAttribute('data-toggle-orig');
+      const orig = document.querySelector(`[data-recipe-orig="${id}"]`);
+      const scaled = document.querySelector(`[data-recipe-scaled="${id}"]`);
+      if (!orig || !scaled) return;
+      const showingScaled = !scaled.classList.contains('hidden');
+      scaled.classList.toggle('hidden', showingScaled);
+      orig.classList.toggle('hidden', !showingScaled);
+      btn.textContent = showingScaled ? 'Show scaled' : 'Show original';
+    };
+  });
+  // Scale-all and re-scale handlers
+  const scaleBtn = document.getElementById('scale-all') || document.getElementById('rescale-all');
+  if (scaleBtn) {
+    scaleBtn.onclick = async () => {
+      if (!state.apiKey) { toast('Set your API key in Setup first'); return; }
+      const targets = (scaleBtn.id === 'scale-all' ? needsScaling : meals).map(({ meal }) => ({
+        meal, targetServings: targetServings[meal.id] || 0,
+      })).filter(x => x.targetServings > 0);
+      if (targets.length === 0) { toast('Nothing to scale'); return; }
+      const sp = document.getElementById('scale-spinner'), lbl = document.getElementById('scale-label');
+      if (sp) sp.classList.remove('hidden'); if (lbl) lbl.textContent = `Scaling ${targets.length}…`;
+      scaleBtn.disabled = true;
+      try {
+        const scaled = await callClaudeForScaledRecipes(targets);
+        if (!state.scaledRecipes) state.scaledRecipes = {};
+        scaled.forEach(r => {
+          if (!r.id) return;
+          state.scaledRecipes[r.id] = {
+            targetServings: Number(r.targetServings) || 0, name: r.name,
+            ingredients: r.ingredients || [], instructions: r.instructions || '',
+            prepNotes: r.prepNotes || '',
+          };
+        });
+        saveState();
+        toast(`Scaled ${scaled.length} recipe${scaled.length===1?'':'s'}`);
+        renderRecipes(root);
+      } catch (e) { toast('Error: ' + e.message); console.error(e); }
+      finally { if (sp) sp.classList.add('hidden'); scaleBtn.disabled = false; }
+    };
+  }
+  // Share recipes panel
+  const shareBtn = document.getElementById('share-recipes');
+  if (shareBtn) {
+    const panel = document.getElementById('share-recipes-panel');
+    shareBtn.onclick = () => panel.classList.toggle('hidden');
+    document.getElementById('make-short-rec').onclick = async () => {
+      const sp = document.getElementById('short-rec-spinner'), lbl = document.getElementById('short-rec-label');
+      const stat = document.getElementById('short-rec-status'), result = document.getElementById('short-rec-result');
+      sp.classList.remove('hidden'); lbl.textContent = 'Uploading…'; stat.textContent = ''; result.innerHTML = '';
+      try {
+        const payload = buildFinalPlanPayload();
+        const compressed = LZString.compressToEncodedURIComponent(JSON.stringify(payload));
+        const id = await postToPasteService(compressed);
+        const shortUrl = location.origin + location.pathname + '#recipes?p=' + id;
+        result.innerHTML = `<label class="block text-sm font-medium text-stone-700 mb-1">Share this link:</label>
+          <div class="flex gap-2">
+            <input id="short-rec-url" readonly value="${escapeHtml(shortUrl)}" class="flex-1 px-3 py-2 border border-stone-300 rounded-md font-mono text-xs bg-emerald-50">
+            <button id="copy-short-rec" class="px-4 py-2 bg-emerald-700 text-white rounded-md text-sm hover:bg-emerald-800">Copy</button>
+          </div><p class="text-xs text-stone-500 mt-1">${shortUrl.length} chars. Re-share after scaling or changing selections.</p>`;
+        document.getElementById('copy-short-rec').onclick = () => copyToClipboard(shortUrl);
+      } catch (e) { stat.innerHTML = `<span class="text-red-700">Error: ${escapeHtml(e.message)}</span>`; }
+      finally { sp.classList.add('hidden'); lbl.textContent = 'Generate short link'; }
+    };
+  }
 }
-function recipeCard(m) {
+function recipeCard(m, targetServings) {
   const macros = m.macrosPerServing || {};
   const urlDisplay = m.recipeUrl
     ? `<a href="${escapeHtml(m.recipeUrl)}" target="_blank" rel="noopener" class="text-emerald-700 underline break-all">${escapeHtml(m.recipeUrl)}</a>`
     : `<span class="text-stone-400 italic">no link saved</span>`;
+  const scaled = state.scaledRecipes?.[m.id];
+  const hasFreshScaled = scaled && targetServings && scaled.targetServings === targetServings;
+  const ingredientsBlock = (servingsLabel, ings, notesItalic) => `
+    <h5 class="font-semibold text-sm text-stone-800 mb-1">Ingredients</h5>
+    <p class="text-xs text-stone-500 mb-1">${servingsLabel}</p>
+    <ul class="text-sm text-stone-700 space-y-0.5">
+      ${(ings || []).map(i => `<li><strong>${escapeHtml(i.amount)} ${escapeHtml(i.unit)}</strong> ${escapeHtml(i.item)}${i.notes ? ` <span class="text-stone-500">(${escapeHtml(i.notes)})</span>` : ''}</li>`).join('')}
+    </ul>
+    ${notesItalic ? `<div class="mt-2 text-xs text-stone-600 italic">${notesItalic}</div>` : ''}`;
+  const instructionsBlock = (instr, notes) => `
+    <h5 class="font-semibold text-sm text-stone-800 mb-1">Instructions</h5>
+    <div class="text-sm text-stone-700 recipe-body">${escapeHtml(instr || '')}</div>
+    ${notes ? `<div class="mt-3 text-xs text-stone-600 italic"><strong>Prep tip:</strong> ${escapeHtml(notes)}</div>` : ''}`;
+  const addonNote = m.carbAddon ? `+ optional add-on per serving: ${escapeHtml(m.carbAddon.amount)} ${escapeHtml(m.carbAddon.unit)} ${escapeHtml(m.carbAddon.item)}` : '';
+  const scaledHtml = hasFreshScaled ? `<div data-recipe-scaled="${m.id}" class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+    <div class="md:col-span-1 bg-emerald-50 p-3 rounded">
+      ${ingredientsBlock(`✨ scaled to ${scaled.targetServings} servings (this week)`, scaled.ingredients, addonNote)}
+    </div>
+    <div class="md:col-span-2">
+      ${instructionsBlock(scaled.instructions, scaled.prepNotes)}
+    </div></div>` : '';
+  const originalHtml = `<div data-recipe-orig="${m.id}" class="${hasFreshScaled ? 'hidden' : ''} mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+    <div class="md:col-span-1">
+      ${ingredientsBlock(`original batch of ${m.servings || '?'}`, m.ingredients, addonNote)}
+    </div>
+    <div class="md:col-span-2">
+      ${instructionsBlock(m.instructions, m.prepNotes)}
+    </div></div>`;
+  const toggleBtn = hasFreshScaled ? `<button data-toggle-orig="${m.id}" class="text-xs text-emerald-700 underline ml-3 no-print">Show original</button>` : '';
   return `<article class="bg-white p-5 rounded-lg border border-stone-200">
     <div class="flex items-start justify-between gap-3 mb-2">
-      <div class="flex-1"><h4 class="font-semibold text-lg">${escapeHtml(m.name)}</h4>
+      <div class="flex-1"><h4 class="font-semibold text-lg">${escapeHtml(m.name)}${hasFreshScaled ? ` <span class="text-xs font-normal text-emerald-700 align-middle">· ✨ scaled to ${scaled.targetServings}</span>` : ''}${toggleBtn}</h4>
         <p class="text-sm text-stone-600">${escapeHtml(m.description || '')}</p></div>
       <div class="flex flex-wrap gap-1 macro text-xs justify-end shrink-0">
         <span class="pill bg-stone-100 text-stone-700">${macros.kcal||'?'} kcal</span>
@@ -483,21 +714,9 @@ function recipeCard(m) {
         <button data-recipe-save="${m.id}" class="px-3 py-1 bg-emerald-700 text-white rounded text-xs hover:bg-emerald-800">Save</button>
         <button data-recipe-edit="${m.id}" class="px-3 py-1 bg-white border border-stone-300 text-stone-700 rounded text-xs hover:bg-stone-100">Cancel</button>
       </div></div>
-    <div class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-      <div class="md:col-span-1">
-        <h5 class="font-semibold text-sm text-stone-800 mb-1">Ingredients</h5>
-        <p class="text-xs text-stone-500 mb-1">batch of ${m.servings || '?'}</p>
-        <ul class="text-sm text-stone-700 space-y-0.5">
-          ${(m.ingredients || []).map(i => `<li><strong>${escapeHtml(i.amount)} ${escapeHtml(i.unit)}</strong> ${escapeHtml(i.item)}${i.notes ? ` <span class="text-stone-500">(${escapeHtml(i.notes)})</span>` : ''}</li>`).join('')}
-        </ul>
-        ${m.carbAddon ? `<div class="mt-2 text-xs text-stone-600 italic">+ optional add-on per serving: ${escapeHtml(m.carbAddon.amount)} ${escapeHtml(m.carbAddon.unit)} ${escapeHtml(m.carbAddon.item)}</div>` : ''}
-      </div>
-      <div class="md:col-span-2">
-        <h5 class="font-semibold text-sm text-stone-800 mb-1">Instructions</h5>
-        <div class="text-sm text-stone-700 recipe-body">${escapeHtml(m.instructions || '')}</div>
-        ${m.prepNotes ? `<div class="mt-3 text-xs text-stone-600 italic"><strong>Prep tip:</strong> ${escapeHtml(m.prepNotes)}</div>` : ''}
-      </div>
-    </div></article>`;
+    ${scaledHtml}
+    ${originalHtml}
+  </article>`;
 }
 
 /* ----- FAVORITES VIEW --------------------------------------- */

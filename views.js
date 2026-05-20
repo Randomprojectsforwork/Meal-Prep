@@ -99,6 +99,65 @@ function extractJson(text) {
   return null;
 }
 
+async function callClaudeForScaledRecipes(mealsWithTargets) {
+  // mealsWithTargets: [{ meal, targetServings }]
+  const sys = `You are a precise recipe scaler. Output ONLY a JSON array. No prose, no markdown.
+
+For each recipe in the input, scale it to the target servings. Rules:
+- Multiply ingredient amounts proportionally. Round to practical kitchen measures (1/4, 1/3, 1/2, 2/3, 3/4, whole numbers).
+- Adjust cooking times only when meaningfully different (e.g., doubled batch on one sheet pan = ~25% more time; same batch on two pans = same time).
+- Mention pan size / vessel upgrades when needed for the larger volume.
+- Keep instructions numbered and clear.
+- All ingredient quantities are TOTAL for the scaled batch.
+- Preserve the original meal id verbatim.
+
+Each output object:
+{ "id": "<original id>", "name": "<original name>", "targetServings": <int>,
+  "ingredients": [{ "item": "lowercase", "amount": <number>, "unit": "...", "aisle": "produce|meat|seafood|dairy|eggs|bakery|pantry|frozen|condiments|spices|other", "notes": "optional" }],
+  "instructions": "1. step\\n2. step",
+  "prepNotes": "1 sentence" }`;
+  const compact = mealsWithTargets.map(({ meal, targetServings }) => ({
+    id: meal.id, name: meal.name,
+    originalServings: meal.servings || 1,
+    targetServings,
+    ingredients: meal.ingredients || [],
+    instructions: meal.instructions || '',
+    prepNotes: meal.prepNotes || '',
+  }));
+  const userMsg = `Scale each recipe to its targetServings. Input:\n\n${JSON.stringify(compact, null, 2)}\n\nReturn ONLY a JSON array.`;
+  const text = await callClaude({ model: state.model || 'claude-sonnet-4-5', max_tokens: 16000, system: sys, messages: [{ role:'user', content: userMsg }] });
+  const parsed = extractJson(text);
+  if (!parsed) throw new Error('Could not parse scaled recipes. First 200 chars: ' + text.slice(0,200));
+  const arr = Array.isArray(parsed) ? parsed : (parsed.recipes || []);
+  if (!Array.isArray(arr) || arr.length === 0) throw new Error('No recipes in scaling response');
+  return arr;
+}
+
+async function callClaudeForConsolidatedList(items) {
+  // items: [{ item, amount, unit, aisle }]
+  const sys = `You are a shopping list consolidator. Output ONLY a JSON array. No prose, no markdown.
+
+Merge duplicate items (same ingredient appearing in multiple lines) by converting units when reliable:
+- "1 cup spinach (loose)" ≈ 1 oz; pack ≈ 5 oz.
+- "1 cup chopped onion" ≈ 1 medium onion; "1 medium onion" ≈ 6 oz.
+- "1 tbsp olive oil" = 0.5 oz; standard bottle = 17 oz.
+- "1 clove garlic" stays as cloves.
+- "1 lb chicken breast" stays as lb.
+- If conversion is unreliable or items are meaningfully different (e.g., "spinach" vs "baby spinach"), keep them separate.
+- After merging, round amounts UP to practical purchase quantities when relevant (e.g., 4.2 oz spinach → buy 5 oz bag).
+- Preserve the aisle field. Sort within aisle by item name.
+
+Output format: same shape as input.
+[{ "item": "lowercase", "amount": <number>, "unit": "oz|lb|cup|tbsp|tsp|clove|whole|...", "aisle": "..." }, ...]`;
+  const userMsg = `Consolidate this shopping list. Input:\n\n${JSON.stringify(items, null, 2)}\n\nReturn ONLY a JSON array of consolidated items.`;
+  const text = await callClaude({ model: state.model || 'claude-sonnet-4-5', max_tokens: 8000, system: sys, messages: [{ role:'user', content: userMsg }] });
+  const parsed = extractJson(text);
+  if (!parsed) throw new Error('Could not parse consolidated list. First 200 chars: ' + text.slice(0,200));
+  const arr = Array.isArray(parsed) ? parsed : (parsed.items || []);
+  if (!Array.isArray(arr)) throw new Error('Expected array in consolidation response');
+  return arr;
+}
+
 /* ----- PICKS VIEW ------------------------------------------- */
 function renderPicks(root) {
   if (!state.lastGeneration) {
